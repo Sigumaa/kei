@@ -28,6 +28,9 @@ class KeiyakuInterpreter:
     _re_loop_start = re.compile(r"^(?P<count>.+) 回、以下を行う。?$")
     _re_loop_end = re.compile(r"^以上。?$")
     _re_return = re.compile(r"^(?P<expr>.+)を返す。?$")
+    _re_if_zero = re.compile(r"^もし (?P<expr>.+) が 0 なら(?:ば)?、以下を行う。?$")
+    _re_if_nonzero = re.compile(r"^もし (?P<expr>.+) が 0 でなければ、以下を行う。?$")
+    _re_else = re.compile(r"^そうでなければ(?:、以下を行う。?)?$")
 
     def __init__(self) -> None:
         self.env: Dict[str, Any] = {}
@@ -219,6 +222,7 @@ class KeiyakuInterpreter:
                 # Collect until '以上。'
                 func_depth = 1
                 loop_depth = 0
+                if_depth = 0
                 block_lines = []
                 j = i + 1
                 while j < len(lines):
@@ -234,6 +238,16 @@ class KeiyakuInterpreter:
                         block_lines.append(candidate_raw)
                         j += 1
                         continue
+                    if self._re_if_zero.match(candidate_norm) or self._re_if_nonzero.match(candidate_norm):
+                        if_depth += 1
+                        block_lines.append(candidate_raw)
+                        j += 1
+                        continue
+                    if self._re_else.match(candidate_norm):
+                        if_depth += 1
+                        block_lines.append(candidate_raw)
+                        j += 1
+                        continue
                     if self._re_loop_end.match(candidate_norm):
                         if loop_depth > 0:
                             loop_depth -= 1
@@ -242,6 +256,11 @@ class KeiyakuInterpreter:
                             continue
                         # else: this '以上。' may close the function
                     if re.match(r"^以上。?$", candidate_norm) and loop_depth == 0:
+                        if if_depth > 0:
+                            if_depth -= 1
+                            block_lines.append(candidate_raw)
+                            j += 1
+                            continue
                         func_depth -= 1
                         if func_depth == 0:
                             break
@@ -268,7 +287,13 @@ class KeiyakuInterpreter:
                 while j < len(lines):
                     candidate_raw = lines[j].rstrip()
                     candidate_norm = normalize_text(candidate_raw)
-                    if self._re_loop_start.match(candidate_norm):
+                    if re.match(r"^(?:関数 )?[^\s()]+\([^)]*\) を(?:関数として)?定義する。?$", candidate_norm):
+                        depth += 1
+                    elif self._re_loop_start.match(candidate_norm):
+                        depth += 1
+                    elif self._re_if_zero.match(candidate_norm) or self._re_if_nonzero.match(candidate_norm):
+                        depth += 1
+                    elif self._re_else.match(candidate_norm):
                         depth += 1
                     elif self._re_loop_end.match(candidate_norm):
                         depth -= 1
@@ -293,6 +318,97 @@ class KeiyakuInterpreter:
                     self.exec(block_src)
                 # Move index past the end marker
                 i = j + 1
+                continue
+            # If block handling
+            m_if0 = self._re_if_zero.match(line)
+            m_ifnz = self._re_if_nonzero.match(line)
+            if m_if0 or m_ifnz:
+                cond_expr = (m_if0 or m_ifnz).group("expr").strip()
+                # Collect THEN block until matching 以上。
+                depth = 1
+                then_lines: list[str] = []
+                j = i + 1
+                while j < len(lines):
+                    candidate_raw = lines[j].rstrip()
+                    candidate_norm = normalize_text(candidate_raw)
+                    if re.match(r"^(?:関数 )?[^\s()]+\([^)]*\) を(?:関数として)?定義する。?$", candidate_norm):
+                        depth += 1
+                        then_lines.append(candidate_raw)
+                        j += 1
+                        continue
+                    if self._re_loop_start.match(candidate_norm):
+                        depth += 1
+                        then_lines.append(candidate_raw)
+                        j += 1
+                        continue
+                    if self._re_if_zero.match(candidate_norm) or self._re_if_nonzero.match(candidate_norm):
+                        depth += 1
+                        then_lines.append(candidate_raw)
+                        j += 1
+                        continue
+                    if self._re_loop_end.match(candidate_norm):
+                        depth -= 1
+                        if depth == 0:
+                            break
+                        then_lines.append(candidate_raw)
+                        j += 1
+                        continue
+                    then_lines.append(candidate_raw)
+                    j += 1
+                if depth != 0:
+                    raise SyntaxError(f"対応する『以上。』が見つかりません (行 {lineno})")
+                # Optionally collect ELSE block if present next
+                k = j + 1
+                # Skip blank lines
+                while k < len(lines) and not normalize_text(lines[k].rstrip()):
+                    k += 1
+                else_lines: list[str] | None = None
+                if k < len(lines):
+                    next_norm = normalize_text(lines[k].rstrip())
+                    if self._re_else.match(next_norm):
+                        # Collect ELSE block similar to THEN
+                        depth2 = 1
+                        else_lines = []
+                        k += 1
+                        while k < len(lines):
+                            cand_raw2 = lines[k].rstrip()
+                            cand_norm2 = normalize_text(cand_raw2)
+                            if re.match(r"^(?:関数 )?[^\s()]+\([^)]*\) を(?:関数として)?定義する。?$", cand_norm2):
+                                depth2 += 1
+                                else_lines.append(cand_raw2)
+                                k += 1
+                                continue
+                            if self._re_loop_start.match(cand_norm2):
+                                depth2 += 1
+                                else_lines.append(cand_raw2)
+                                k += 1
+                                continue
+                            if self._re_if_zero.match(cand_norm2) or self._re_if_nonzero.match(cand_norm2):
+                                depth2 += 1
+                                else_lines.append(cand_raw2)
+                                k += 1
+                                continue
+                            if self._re_loop_end.match(cand_norm2):
+                                depth2 -= 1
+                                if depth2 == 0:
+                                    break
+                                else_lines.append(cand_raw2)
+                                k += 1
+                                continue
+                            else_lines.append(cand_raw2)
+                            k += 1
+                        if depth2 != 0:
+                            raise SyntaxError(f"対応する『以上。』が見つかりません (行 {lineno})")
+                # Evaluate and execute
+                cond_val = self._value_of(cond_expr)
+                if not isinstance(cond_val, (int, float)):
+                    raise TypeError(f"条件式は数値である必要があります (行 {lineno})")
+                is_true = (cond_val == 0) if m_if0 else (cond_val != 0)
+                exec_src = "\n".join(then_lines if is_true else (else_lines or []))
+                if exec_src:
+                    self.exec(exec_src)
+                # Advance index past THEN (and ELSE if existed)
+                i = (k if else_lines is not None else j) + 1
                 continue
             # Normal single-line execution
             try:
